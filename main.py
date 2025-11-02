@@ -3,7 +3,7 @@ import sys
 import asyncio
 import subprocess
 import zipfile
-import shutil # ADDED for robust file operations
+import shutil
 from aiohttp import web
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
@@ -41,7 +41,7 @@ WATI_PASSWORD = os.environ.get("WATI_PASSWORD")
 WATI_CLIENT_ID = os.environ.get("WATI_CLIENT_ID")
 
 
-# 🧩 Unzip saved login profile (UPDATED FOR ROBUST EXTRACTION)
+# 🧩 Unzip saved login profile
 def unzip_wati_profile():
     zip_path = os.path.join(os.getcwd(), "wati_profile.zip")
     if ON_RENDER and os.path.exists(zip_path):
@@ -60,9 +60,7 @@ def unzip_wati_profile():
 
                 # 2. Extract contents directly into the USER_DATA_DIR
                 with zipfile.ZipFile(zip_path, "r") as zip_ref:
-                    # Iterate members to avoid creating an extra top-level folder
                     for member in zip_ref.namelist():
-                        # Only extract files, not directories
                         if not member.endswith('/'):
                             filename = os.path.basename(member)
                             source = zip_ref.open(member)
@@ -136,8 +134,7 @@ async def wait_for_manual_login(page, browser_context):
         return False
 
 
-# ✅ Automatic login function (FINAL ROBUST VERSION)
-# ✅ Automatic login function (FINAL ROBUST VERSION with Enter Key Submission)
+# ✅ Automatic login function (FINAL ROBUST VERSION with JS Fallback)
 async def auto_login(page):
     print("🔑 Attempting automatic login...", flush=True)
 
@@ -145,50 +142,61 @@ async def auto_login(page):
         print("🚨 Automatic login failed: Missing WATI_EMAIL, WATI_PASSWORD, or WATI_CLIENT_ID environment variables.", flush=True)
         return False
 
-    # --- TEMPORARY DEBUGGING CODE (Remove after use) ---
-    # print(f"DEBUG: Using Email: {WATI_EMAIL[:4]}... | Password Length: {len(WATI_PASSWORD)} | Client ID: {WATI_CLIENT_ID}", flush=True)
-    # --- END TEMPORARY DEBUGGING CODE ---
+    # --- TEMPORARY DEBUGGING CODE: DELETE THIS AFTER VERIFYING CREDENTIALS IN LOGS ---
+    print(f"DEBUG: Using Email: {WATI_EMAIL[:4]}... | Password Length: {len(WATI_PASSWORD)} | Client ID: {WATI_CLIENT_ID}", flush=True)
+    # ---------------------------------------------------------------------------------
 
     try:
-        # 1. Navigate to the login page first
+        # 1. Navigate and wait for form
         await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
-        
-        # Wait longer for the form to load (30s)
         await page.wait_for_selector('form button[type="submit"]', timeout=30000) 
 
-        # 2. Use page.fill() for stability
+        # 2. Fill credentials
         print("➡️ Filling credentials...", flush=True)
-        
         await page.fill('input[name="email"]', WATI_EMAIL)
         await page.fill('input[name="password"]', WATI_PASSWORD)
-        
-        # Last field filled: input[name="tenantId"]
         await page.fill('input[name="tenantId"]', WATI_CLIENT_ID)
-
-        # Check the "Remember Me" box if it's not checked
         checkbox_selector = '.right-box__check-box div[role="checkbox"].unchecked'
         if await page.is_visible(checkbox_selector, timeout=5000):
             await page.click(checkbox_selector)
         
-        # 3. Submission using the Enter key (REPLACES THE BUTTON CLICK)
-        print("➡️ Form filled. Submitting with Enter key...", flush=True)
-
-        # Focus the last field to ensure the Enter key press is registered by the form
-        await page.focus('input[name="tenantId"]') 
-
-        # Press Enter and wait for the resulting navigation
-        async with page.expect_navigation(url=WATI_URL, timeout=60000): 
-            await page.keyboard.press('Enter') # The most reliable way to submit a focused form
-
-        # 4. Final confirmation wait for the destination element
-        await page.wait_for_selector("text=Team Inbox", timeout=60000) 
-        print("✅ Automatic login successful!", flush=True)
-        return True
-    
-    except PlaywrightTimeout as e:
-        print("❌ Automatic login failed. Timeout waiting for form elements or 'Team Inbox'.", flush=True)
+        # 3. Submission Attempt 1: Playwright Click + Wait (45s timeout)
+        print("➡️ Submitting with Playwright click...", flush=True)
         
-        # Check for error message on the login page
+        success = False
+        try:
+            # Click and wait for navigation 
+            async with page.expect_navigation(url=WATI_URL, timeout=45000):
+                await page.click('form button[type="submit"]', timeout=30000)
+            success = True
+        except PlaywrightTimeout:
+            print("⚠️ Playwright click failed to trigger navigation. Attempting aggressive JavaScript submission...", flush=True)
+            
+            # Submission Attempt 2: Direct JavaScript Submission (Aggressive Fallback)
+            # This bypasses all actionability checks by running code in the browser context
+            await page.evaluate('''() => {
+                // Try to find the form and submit it, or fall back to clicking the button via JS
+                const form = document.querySelector('form'); 
+                if (form) {
+                    form.submit(); 
+                } else {
+                    document.querySelector('form button[type="submit"]').click();
+                }
+            }''')
+            
+            # Wait longer for the final element after the forced submission (60s total)
+            await page.wait_for_selector("text=Team Inbox", timeout=60000) 
+            success = True
+            
+        # 4. Final confirmation
+        if success:
+            await page.wait_for_selector("text=Team Inbox", timeout=15000) 
+            print("✅ Automatic login successful!", flush=True)
+            return True
+        return False
+
+    except PlaywrightTimeout as e:
+        print("❌ Automatic login failed. Timeout waiting for final page. Check credentials.", flush=True)
         error_locator = page.locator(".right-box__error-msg")
         if await error_locator.is_visible(timeout=5000):
             error_text = await error_locator.text_content()
@@ -202,7 +210,7 @@ async def auto_login(page):
         return False
 
 
-# ✅ Main automation loop (No changes)
+# ✅ Main automation loop
 async def main_automation(page):
     while True:
         print("🔎 Checking for unread chats...", flush=True)
@@ -264,7 +272,7 @@ async def main_automation(page):
         await page.reload(wait_until="domcontentloaded")
 
 
-# ✅ Main bot flow
+# ✅ Main bot flow (Updated with User-Agent)
 async def run_wati_bot():
     print("🌐 Launching WATI automation with persistent browser...", flush=True)
     headless_mode = ON_RENDER 
@@ -273,6 +281,8 @@ async def run_wati_bot():
         browser_context = await p.chromium.launch_persistent_context(
             user_data_dir=USER_DATA_DIR,
             headless=headless_mode,
+            # ADDED: Set a common User-Agent for better bot detection evasion
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--single-process"]
         )
         if len(browser_context.pages) == 0:
@@ -295,11 +305,9 @@ async def run_wati_bot():
         except PlaywrightTimeout:
             print("⚠️ Session inactive, attempting automatic login...", flush=True)
             
-            # --- FIX: Clear storage on login failure to ensure a clean auto-login attempt ---
             if os.path.exists(storage_path):
                  print("🗑️ Clearing expired persistent storage...", flush=True)
                  os.remove(storage_path)
-            # --- END FIX ---
             
             success = await auto_login(page)
             
@@ -351,4 +359,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except Exception as e:
         print(f"🔥 Application stopped due to unhandled error: {e}", flush=True)
-
