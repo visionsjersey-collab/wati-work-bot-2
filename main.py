@@ -137,12 +137,17 @@ async def wait_for_manual_login(page, browser_context):
 
 
 # ✅ Automatic login function (FINAL ROBUST VERSION)
+# ✅ Automatic login function (FINAL ROBUST VERSION with Enter Key Submission)
 async def auto_login(page):
     print("🔑 Attempting automatic login...", flush=True)
 
     if not all([WATI_EMAIL, WATI_PASSWORD, WATI_CLIENT_ID]):
         print("🚨 Automatic login failed: Missing WATI_EMAIL, WATI_PASSWORD, or WATI_CLIENT_ID environment variables.", flush=True)
         return False
+
+    # --- TEMPORARY DEBUGGING CODE (Remove after use) ---
+    # print(f"DEBUG: Using Email: {WATI_EMAIL[:4]}... | Password Length: {len(WATI_PASSWORD)} | Client ID: {WATI_CLIENT_ID}", flush=True)
+    # --- END TEMPORARY DEBUGGING CODE ---
 
     try:
         # 1. Navigate to the login page first
@@ -151,11 +156,13 @@ async def auto_login(page):
         # Wait longer for the form to load (30s)
         await page.wait_for_selector('form button[type="submit"]', timeout=30000) 
 
-        # 2. Use page.fill() and page.click() for stability
+        # 2. Use page.fill() for stability
         print("➡️ Filling credentials...", flush=True)
         
         await page.fill('input[name="email"]', WATI_EMAIL)
         await page.fill('input[name="password"]', WATI_PASSWORD)
+        
+        # Last field filled: input[name="tenantId"]
         await page.fill('input[name="tenantId"]', WATI_CLIENT_ID)
 
         # Check the "Remember Me" box if it's not checked
@@ -163,15 +170,17 @@ async def auto_login(page):
         if await page.is_visible(checkbox_selector, timeout=5000):
             await page.click(checkbox_selector)
         
-        # 3. Click the Login button and wait for the resulting navigation/page change
-        print("➡️ Login button clicked. Waiting for successful navigation...", flush=True)
-        
-        # We wrap the click in expect_navigation for maximum reliability 
-        # (this waits for the browser to register the next page load/route change)
-        async with page.expect_navigation(url=WATI_URL): # Expect navigation to WATI_URL
-            await page.click('form button[type="submit"]')
-        
-        # 4. Wait for the final element on the page (60s)
+        # 3. Submission using the Enter key (REPLACES THE BUTTON CLICK)
+        print("➡️ Form filled. Submitting with Enter key...", flush=True)
+
+        # Focus the last field to ensure the Enter key press is registered by the form
+        await page.focus('input[name="tenantId"]') 
+
+        # Press Enter and wait for the resulting navigation
+        async with page.expect_navigation(url=WATI_URL, timeout=60000): 
+            await page.keyboard.press('Enter') # The most reliable way to submit a focused form
+
+        # 4. Final confirmation wait for the destination element
         await page.wait_for_selector("text=Team Inbox", timeout=60000) 
         print("✅ Automatic login successful!", flush=True)
         return True
@@ -179,11 +188,14 @@ async def auto_login(page):
     except PlaywrightTimeout as e:
         print("❌ Automatic login failed. Timeout waiting for form elements or 'Team Inbox'.", flush=True)
         
+        # Check for error message on the login page
         error_locator = page.locator(".right-box__error-msg")
         if await error_locator.is_visible(timeout=5000):
             error_text = await error_locator.text_content()
             if error_text.strip():
                 print(f"⚠️ Page Error Message: {error_text.strip()}", flush=True)
+            else:
+                 print("⚠️ Login failed, but no visible error message found. Check credentials.", flush=True)
         return False
     except Exception as e:
         print(f"❌ An unexpected error occurred during login: {e}", flush=True)
@@ -339,3 +351,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except Exception as e:
         print(f"🔥 Application stopped due to unhandled error: {e}", flush=True)
+
