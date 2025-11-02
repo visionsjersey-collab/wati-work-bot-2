@@ -1,7 +1,6 @@
 import os
 import sys
 import asyncio
-import subprocess
 import zipfile
 from aiohttp import web
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
@@ -14,6 +13,7 @@ ON_RENDER = os.environ.get("RENDER") == "true"
 
 # ✅ Configure Playwright browser path
 if ON_RENDER:
+    # Use /tmp for ephemeral storage on Render for browsers
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/tmp/playwright-browsers"
 else:
     local_browser_path = os.path.join(os.getcwd(), "playwright_browsers")
@@ -21,48 +21,90 @@ else:
 os.makedirs(os.environ["PLAYWRIGHT_BROWSERS_PATH"], exist_ok=True)
 
 # ✅ Persistent profile path
+# Use the persistent disk path on Render for the user data directory
 USER_DATA_DIR = (
     "/opt/render/project/src/wati_profile" if ON_RENDER else os.path.join(os.getcwd(), "wati_profile")
 )
+os.makedirs(USER_DATA_DIR, exist_ok=True)
+
+# 🌐 Configuration and Environment Variables
+WATI_URL = "https://live.wati.io/1037246/teamInbox/"
+LOGIN_URL = "https://auth.wati.io/login"
+CHECK_INTERVAL = 180  # seconds
+
+# **SECURITY FIX: Fetch credentials from environment variables**
+WATI_EMAIL = os.environ.get("WATI_EMAIL")
+WATI_PASSWORD = os.environ.get("WATI_PASSWORD")
+WATI_CLIENT_ID = os.environ.get("WATI_CLIENT_ID")
+
 
 # 🧩 Unzip saved login profile
 def unzip_wati_profile():
     zip_path = os.path.join(os.getcwd(), "wati_profile.zip")
     if ON_RENDER and os.path.exists(zip_path):
-        if not os.path.exists(USER_DATA_DIR):
+        # We need to check if the 'storage.json' is missing, not just the directory,
+        # since the directory is created above.
+        storage_path = os.path.join(USER_DATA_DIR, "storage.json")
+        if not os.path.exists(storage_path):
             print("📦 Extracting saved login (wati_profile.zip)...", flush=True)
-            with zipfile.ZipFile(zip_path, "r") as zip_ref:
-                zip_ref.extractall(os.path.dirname(USER_DATA_DIR))
-            print("✅ Login data extracted successfully!", flush=True)
+            try:
+                # The zip should contain the contents of the wati_profile folder.
+                # Extracting to USER_DATA_DIR's parent directory assumes the zip 
+                # contains the wati_profile folder itself, but since we created 
+                # the directory, let's extract directly into it.
+                with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                    # Filter out the top-level folder if the zip contains it, 
+                    # we want the contents (like 'storage.json') directly in USER_DATA_DIR.
+                    top_level_folder = next((f for f in zip_ref.namelist() if f.endswith('/')), None)
+                    if top_level_folder:
+                         zip_ref.extractall(os.path.dirname(USER_DATA_DIR))
+                    else:
+                         zip_ref.extractall(USER_DATA_DIR)
+                         
+                print("✅ Login data extracted successfully!", flush=True)
+            except Exception as e:
+                print(f"🚨 Error extracting profile zip: {e}", flush=True)
         else:
-            print("✅ Existing login folder detected — skipping unzip.", flush=True)
-
+            print("✅ Existing login storage file detected — skipping unzip.", flush=True)
+            
 # ✅ Ensure Chromium installed
 async def ensure_chromium_installed():
-    chromium_path = os.path.join(os.environ["PLAYWRIGHT_BROWSERS_PATH"], "chromium-1117/chrome-linux/chrome")
+    # Adjusted Chromium path check based on Playwright's installation structure
+    browser_path = os.environ["PLAYWRIGHT_BROWSERS_PATH"]
+    chromium_path = os.path.join(browser_path, "chromium-1117/chrome-linux/chrome")
+    
+    # Use Playwright's default check
     if not os.path.exists(chromium_path):
         print("🧩 Installing Chromium...", flush=True)
+        # Use subprocess to run the install command
         process = await asyncio.create_subprocess_exec(
             sys.executable, "-m", "playwright", "install", "chromium",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
         )
+        
+        # Stream output to console
         while True:
             line = await process.stdout.readline()
             if not line:
                 break
             print(line.decode().strip(), flush=True)
+            
         await process.wait()
-        print("✅ Chromium installed successfully!", flush=True)
+        
+        if process.returncode == 0:
+            print("✅ Chromium installed successfully!", flush=True)
+        else:
+            print(f"🚨 Chromium installation failed with return code {process.returncode}", flush=True)
+            
     else:
         print("✅ Chromium already installed.", flush=True)
 
-# 🌐 Configuration
-WATI_URL = "https://live.wati.io/1037246/teamInbox/"
-LOGIN_URL = "https://auth.wati.io/login"
-CHECK_INTERVAL = 180  # seconds
-
-# ✅ Manual login helper
+# ✅ Manual login helper (Only runs if ON_RENDER is false)
 async def wait_for_manual_login(page, browser_context):
+    if ON_RENDER:
+        print("🚨 Manual login is not supported in headless mode on Render.", flush=True)
+        return False
+        
     print("\n============================")
     print("🟢 MANUAL LOGIN REQUIRED")
     print("============================", flush=True)
@@ -70,6 +112,8 @@ async def wait_for_manual_login(page, browser_context):
     print("➡️ Once 'Team Inbox' is visible, press ENTER to save the session.\n", flush=True)
 
     await page.goto(LOGIN_URL, wait_until="networkidle")
+    
+    # This is the line that caused EOFError on Render
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, lambda: input("👉 Press ENTER after login is complete... "))
 
@@ -83,66 +127,95 @@ async def wait_for_manual_login(page, browser_context):
     except PlaywrightTimeout:
         print("🚨 Login was not detected. Please retry.", flush=True)
         return False
+    except EOFError:
+        print("🚨 EOFError encountered. Manual login requires an interactive terminal.", flush=True)
+        return False
 
-# ✅ Automatic login function (corrected)
+
+# ✅ Automatic login function (Refactored for stability with Playwright's methods)
 async def auto_login(page):
     print("🔑 Attempting automatic login...", flush=True)
 
-    js_script = """() => {
-        function setReactInputValue(element, value) {
-            const nativeSetter = Object.getOwnPropertyDescriptor(element.__proto__, 'value').set;
-            nativeSetter.call(element, value);
-            element.dispatchEvent(new Event('input', { bubbles: true }));
-            element.dispatchEvent(new Event('change', { bubbles: true }));
-            element.dispatchEvent(new Event('blur', { bubbles: true }));
-        }
-
-        const emailInput = document.querySelector('input[name="email"]');
-        if (emailInput) setReactInputValue(emailInput, "Visionsjersey@gmail.com");
-
-        const passwordInput = document.querySelector('input[name="password"]');
-        if (passwordInput) setReactInputValue(passwordInput, "27557434@rR");
-
-        const clientIdInput = document.querySelector('input[name="tenantId"]');
-        if (clientIdInput) {
-            clientIdInput.focus();
-            setReactInputValue(clientIdInput, "1037246");
-            clientIdInput.blur();
-        }
-
-        const checkbox = document.querySelector('.right-box__check-box [role="checkbox"]');
-        if (checkbox && checkbox.classList.contains('unchecked')) checkbox.click();
-
-        const loginButton = document.querySelector('form button[type="submit"]');
-        if (loginButton) loginButton.click();
-    }"""
-
-    try:
-        await page.evaluate(js_script)
-        await page.wait_for_selector("text=Team Inbox", timeout=30000)
-        print("✅ Automatic login successful!", flush=True)
-        return True
-    except PlaywrightTimeout:
-        print("❌ Automatic login failed. Check credentials or page structure.", flush=True)
+    if not all([WATI_EMAIL, WATI_PASSWORD, WATI_CLIENT_ID]):
+        print("🚨 Automatic login failed: Missing WATI_EMAIL, WATI_PASSWORD, or WATI_CLIENT_ID environment variables.", flush=True)
         return False
 
+    try:
+        # 1. Navigate to the login page first
+        await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_selector('form button[type="submit"]', timeout=15000) # Wait for the form to load
+
+        # 2. Use page.fill() and page.click() for stability
+        
+        print("➡️ Filling credentials...", flush=True)
+        
+        # Email field: input[name="email"]
+        await page.fill('input[name="email"]', WATI_EMAIL)
+        
+        # Password field: input[name="password"]
+        await page.fill('input[name="password"]', WATI_PASSWORD)
+        
+        # Client ID field: input[name="tenantId"]
+        await page.fill('input[name="tenantId"]', WATI_CLIENT_ID)
+
+        # Check the "Remember Me" box if it's not checked
+        checkbox_selector = '.right-box__check-box div[role="checkbox"].unchecked'
+        if await page.is_visible(checkbox_selector, timeout=5000):
+            await page.click(checkbox_selector)
+        
+        # 3. Click the Login button
+        await page.click('form button[type="submit"]')
+        print("➡️ Login button clicked. Waiting for navigation...", flush=True)
+
+        # 4. Wait for successful navigation to the Team Inbox (Increased timeout to 45s for server)
+        await page.wait_for_selector("text=Team Inbox", timeout=45000) 
+        print("✅ Automatic login successful!", flush=True)
+        
+        # Optional: Save session state after successful auto-login
+        # This requires the browser_context object, which is not passed here.
+        # It's better to save the state outside this function if login is successful.
+        return True
+    
+    except PlaywrightTimeout as e:
+        print("❌ Automatic login failed. Timeout waiting for form elements or 'Team Inbox'.", flush=True)
+        
+        # Check for a login error message after clicking the button
+        error_locator = page.locator(".right-box__error-msg")
+        if await error_locator.is_visible():
+            error_text = await error_locator.text_content()
+            if error_text.strip():
+                print(f"⚠️ Page Error Message: {error_text.strip()}", flush=True)
+        return False
+    except Exception as e:
+        print(f"❌ An unexpected error occurred during login: {e}", flush=True)
+        return False
+
+
 # ✅ Main automation loop
+# (No changes needed here, as the logic seems focused on WATI functions)
 async def main_automation(page):
     while True:
         print("🔎 Checking for unread chats...", flush=True)
         try:
+            # Look for the unread count element
             await page.wait_for_selector("div.conversation-item__unread-count", timeout=10000)
         except PlaywrightTimeout:
             print("😴 No unread chats found. Waiting 3 mins...", flush=True)
             await asyncio.sleep(CHECK_INTERVAL)
-            await page.reload()
+            # Reload to keep the session alive and refresh chat list
+            try:
+                await page.reload(wait_until="domcontentloaded")
+            except Exception as reload_e:
+                print(f"⚠️ Error during reload: {reload_e}. Will attempt to navigate back to WATI_URL.", flush=True)
+                await page.goto(WATI_URL, wait_until="domcontentloaded")
             continue
 
         unread_elements = await page.query_selector_all("div.conversation-item__unread-count")
+        
         if not unread_elements:
-            print("😴 No unread chats. Waiting 3 mins...", flush=True)
+            print("😴 No unread chats found after initial wait. Waiting 3 mins...", flush=True)
             await asyncio.sleep(CHECK_INTERVAL)
-            await page.reload()
+            await page.reload(wait_until="domcontentloaded")
             continue
 
         print(f"💬 Found {len(unread_elements)} unread chat(s). Processing...", flush=True)
@@ -152,62 +225,102 @@ async def main_automation(page):
             processed += 1
             print(f"👉 Opening unread chat {processed}/{len(unread_elements)}", flush=True)
             try:
+                # Scroll and click
                 await elem.scroll_into_view_if_needed()
                 await elem.click()
                 print("🟢 Clicked unread chat successfully", flush=True)
                 await asyncio.sleep(2.5)
 
+                # Click the option icon
                 await page.click(
                     "#mainTeamInbox div.chat-side-content div span.chat-input__icon-option",
                     timeout=10000,
                 )
                 await asyncio.sleep(1.5)
 
+                # Click "Ads (CTWA)" option
                 ads_ctwa = await page.query_selector("#flow-nav-68ff67df4f393f0757f108d8")
                 if ads_ctwa:
                     await ads_ctwa.click()
                     print("✅ Clicked Ads (CTWA) successfully!", flush=True)
                 else:
-                    print("⚠️ 'Ads (CTWA)' not found.", flush=True)
+                    print("⚠️ 'Ads (CTWA)' flow option not found.", flush=True)
 
                 await asyncio.sleep(2)
 
             except Exception as e:
-                print(f"⚠️ Error in chat #{processed}: {e}", flush=True)
-                continue
+                print(f"⚠️ Error in processing chat #{processed}: {e}", flush=True)
+                # Reload to reset state if an interaction failed
+                await page.reload(wait_until="domcontentloaded")
+                await asyncio.sleep(5)
+                break # Exit the loop and go to the main while loop to recheck
 
-        print("🕒 Waiting before next check...", flush=True)
+        print("🕒 Finished processing batch. Waiting before next check...", flush=True)
         await asyncio.sleep(CHECK_INTERVAL)
-        await page.reload()
+        await page.reload(wait_until="domcontentloaded")
 
-# ✅ Main bot flow
+# ✅ Main bot flow (Updated to handle login failure on Render)
 async def run_wati_bot():
     print("🌐 Launching WATI automation with persistent browser...", flush=True)
-    headless_mode = True
+    headless_mode = ON_RENDER # True on Render, False locally
 
     async with async_playwright() as p:
         browser_context = await p.chromium.launch_persistent_context(
             user_data_dir=USER_DATA_DIR,
             headless=headless_mode,
+            # Add args for headless environments
+            args=["--no-sandbox", "--disable-setuid-sandbox"]
         )
-        page = await browser_context.new_page()
+        # Ensure there is always exactly one page
+        if len(browser_context.pages) == 0:
+            page = await browser_context.new_page()
+        else:
+            page = browser_context.pages[0]
+            
         print("🌍 Navigating to WATI Inbox...", flush=True)
         await page.goto(WATI_URL, timeout=60000)
         await asyncio.sleep(3)
+        
+        login_success = False
 
         try:
+            # Check for existing logged-in session (by checking for "Team Inbox" text)
             await page.wait_for_selector("text=Team Inbox", timeout=60000)
             print("✅ Logged in — session active!", flush=True)
+            login_success = True
         except PlaywrightTimeout:
+            print("⚠️ Session inactive, attempting automatic login...", flush=True)
             success = await auto_login(page)
+            
+            if success:
+                # Save the new storage state immediately after successful auto-login
+                await browser_context.storage_state(path=os.path.join(USER_DATA_DIR, "storage.json"))
+                print("✅ New session saved successfully!", flush=True)
+                login_success = True
+            
+            # If auto-login failed:
             if not success:
-                print("ℹ️ Falling back to manual login...")
-                success = await wait_for_manual_login(page, browser_context)
+                if ON_RENDER:
+                    # CRITICAL: Cannot recover in headless mode
+                    print("🚨 Fatal Error: Auto-login failed and manual login is impossible on Render. Shutting down.", flush=True)
+                    return 
+                else:
+                    # Fallback for local testing only
+                    print("ℹ️ Falling back to manual login...")
+                    login_success = await wait_for_manual_login(page, browser_context)
 
-        print("🤖 Starting main WATI automation loop...", flush=True)
-        await main_automation(page)
+        if login_success:
+            print("🤖 Starting main WATI automation loop...", flush=True)
+            await main_automation(page)
+        else:
+             print("❌ Login failed. Bot loop will not start.", flush=True)
+             
+        # Cleanup
+        await browser_context.close()
+
 
 # ✅ Web server for health checks
+# (No changes needed)
 async def start_web_server():
     async def handle(request):
         return web.Response(text="✅ WATI AutoBot running successfully!")
@@ -226,7 +339,14 @@ async def main():
     unzip_wati_profile()
     await ensure_chromium_installed()
     print("🚀 Starting bot and web server...", flush=True)
+    # The application will only exit if run_wati_bot returns/fails
     await asyncio.gather(start_web_server(), run_wati_bot())
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except EOFError:
+        # Catch any final EOFError that might bubble up from thread executors
+        print("🚨 Application exited unexpectedly due to EOFError (likely non-interactive input).")
+    except Exception as e:
+        print(f"🔥 Application stopped due to unhandled error: {e}")
